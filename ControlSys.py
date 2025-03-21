@@ -9,13 +9,14 @@ from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, precision_score, recall_score
 from pynput.keyboard import Controller, Key
 import tkinter as tk
+from tkinter import messagebox
 
 # Import BrainFlow modules for real EEG acquisition
 from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
 
 # For deep learning option – using TensorFlow/Keras
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense
+from tensorflow.keras.layers import Dense, Dropout
 import tensorflow as tf
 
 # ----------------------------
@@ -24,7 +25,6 @@ import tensorflow as tf
 gpus = tf.config.experimental.list_physical_devices('GPU')
 if gpus:
     try:
-        # Enable memory growth on each GPU
         for gpu in gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         print(f"Using GPU: {gpus}")
@@ -37,16 +37,19 @@ else:
 # Global Settings and Variables
 # ----------------------------
 SIMULATED = False         # Use simulated data if True or if board initialization fails
-USE_DEEP_LEARNING = False # Toggle between SVM and deep learning classifier
+USE_DEEP_LEARNING = True # Toggle between SVM and deep learning classifier
 running = False           # Flag to control real-time EEG processing loop
+
+# Define the 8 electrode names (your chosen electrodes)
+electrode_names = ["Fp1", "F7", "Fz", "F3", "C3", "Cz", "O1", "O2"]
 
 # Map actions to keyboard keys (for "none", no key is pressed)
 ACTIONS = {
     "none": None,
-    "blink": Key.enter,
-    "jaw": Key.right,
+    "blink": Key.down,
+    "jaw": Key.up,
     "relax": Key.space,
-    "motor": Key.left,
+    "motor": Key.caps_lock,
     "mental": Key.shift
 }
 
@@ -54,7 +57,7 @@ ACTIONS = {
 ACTION_TO_INDEX = {action: idx for idx, action in enumerate(ACTIONS.keys())}
 INDEX_TO_ACTION = {idx: action for action, idx in ACTION_TO_INDEX.items()}
 
-# Global variables for the classifier and its statistics
+# Global variables for the classifier and its performance statistics
 classifier = None
 model_stats = {}
 
@@ -91,8 +94,8 @@ def initialize_board():
     global board, BOARD_ID, SIMULATED
     try:
         params = BrainFlowInputParams()
-        # Uncomment and adjust if a specific serial port is needed:
-        # params.serial_port = '/dev/ttyUSB0'  # Linux or 'COM3' for Windows
+        # If needed, set the serial port, e.g.:
+        params.serial_port = 'COM7'
         BOARD_ID = BoardIds.CYTON_BOARD.value
         board = BoardShim(BOARD_ID, params)
         BoardShim.enable_dev_board_logger()
@@ -116,12 +119,12 @@ def close_board():
         print("BrainFlow session closed.")
 
 # ----------------------------
-# EEG Data Acquisition and Processing
+# EEG Data Acquisition
 # ----------------------------
-def get_filtered_eeg():
+def get_raw_eeg():
     """
-    Acquires a 0.5-second (125 samples at 250 Hz) window of EEG data (via BrainFlow or simulated)
-    and applies a 5th-order Butterworth bandpass filter (1-50 Hz).
+    Acquires a 0.5-second (125 samples at 250 Hz) window of raw EEG data from the board
+    (or generates simulated raw data if necessary). Only the 8 EEG channels are selected.
     """
     fs = 250
     n_samples = int(fs * 0.5)
@@ -129,23 +132,34 @@ def get_filtered_eeg():
         try:
             data = board.get_current_board_data(n_samples)
             eeg_channels = BoardShim.get_eeg_channels(BOARD_ID)
-            eeg_data = data[eeg_channels, :]
-            print("Acquired EEG data from OpenBCI Cyton.")
+            raw_data = data[eeg_channels, :]
+            print("Acquired raw EEG data from OpenBCI Cyton.")
         except Exception as e:
-            print(f"Error acquiring data from board: {e}\nUsing simulated data instead.")
-            eeg_data = generate_simulated_eeg(8, n_samples, fs)
+            print(f"Error acquiring raw data from board: {e}\nUsing simulated data instead.")
+            raw_data = generate_simulated_eeg(8, n_samples, fs)
     else:
-        eeg_data = generate_simulated_eeg(8, n_samples, fs)
+        raw_data = generate_simulated_eeg(8, n_samples, fs)
+    return raw_data
 
+# ----------------------------
+# EEG Data Filtering
+# ----------------------------
+def filter_eeg(eeg_data, fs=250):
+    """
+    Applies a 5th-order Butterworth bandpass filter (1-50 Hz) to the provided EEG data.
+    """
     b, a = signal.butter(5, [1.0 / (0.5 * fs), 50.0 / (0.5 * fs)], btype='band')
     filtered_data = signal.filtfilt(b, a, eeg_data, axis=1)
     return filtered_data
 
+# ----------------------------
+# Feature Extraction
+# ----------------------------
 def extract_features(eeg_data):
     """
-    Computes features by calculating the average power in the alpha (8-12 Hz),
+    Computes basic spectral features by calculating the average power in the alpha (8-12 Hz),
     beta (12-30 Hz), and gamma (30-50 Hz) bands for each channel.
-    Returns a feature vector.
+    Returns a concatenated feature vector.
     """
     fs = 250
     features = []
@@ -156,6 +170,57 @@ def extract_features(eeg_data):
         gamma_power = np.mean(Pxx[(f >= 30) & (f <= 50)])
         features.extend([alpha_power, beta_power, gamma_power])
     return np.array(features)
+
+def extract_csp_features(raw_data):
+    """
+    Extracts CSP features from raw EEG data using precomputed spatial filters.
+    If a file 'csp_filters.pkl' exists, it loads the filters (expected shape: (n_filters, 8))
+    and projects the raw data (8, n_samples) onto these filters. Then it computes the log-variance
+    of each projected signal as CSP features.
+    If no filters are found, returns an empty array.
+    """
+    #TODO: Make computation of the csp filters dudring training 
+    if os.path.exists("csp_filters.pkl"):
+        with open("csp_filters.pkl", "rb") as f:
+            filters = pickle.load(f)  # Expected shape: (n_filters, 8)
+        # Project raw data: shape -> (n_filters, n_samples)
+        projected = np.dot(filters, raw_data)
+        variances = np.var(projected, axis=1)
+        features = np.log(variances + 1e-6)  # Add small epsilon to avoid log(0)
+        return features
+    else:
+        return np.array([])
+
+def extract_all_features(raw_data):
+    """
+    Given raw EEG data (8 channels, 0.5 sec), this function:
+      1. Filters the raw data.
+      2. Extracts basic spectral features (alpha, beta, gamma) for each channel.
+      3. Computes frontal theta and alpha power (from channels 0-3) and their ratio.
+      4. Extracts CSP features (if precomputed filters are available).
+    Returns the concatenated feature vector.
+    """
+    fs = 250
+    # Step 1: Filter the raw data
+    filtered_data = filter_eeg(raw_data, fs)
+    # Step 2: Basic spectral features (24 features: 3 per channel * 8 channels)
+    base_features = extract_features(filtered_data)
+    # Step 3: Mental load features: frontal theta (4-7 Hz) and alpha (8-12 Hz)
+    # Assume channels 0-3 correspond to frontal electrodes (Fp1, F7, Fz, F3)
+    frontal_data = filtered_data[0:6, :]
+    f, Pxx = signal.welch(frontal_data, fs=fs, axis=1, nperseg=frontal_data.shape[1])
+    theta_power = np.mean(Pxx[:, (f >= 4) & (f < 7)], axis=1)
+    alpha_power_frontal = np.mean(Pxx[:, (f >= 8) & (f < 12)], axis=1)
+    avg_theta = np.mean(theta_power)
+    avg_alpha = np.mean(alpha_power_frontal)
+    theta_ratio = avg_theta / avg_alpha if avg_alpha != 0 else 0
+    mental_features = np.array([avg_theta, avg_alpha, theta_ratio])
+    # Step 4: CSP features (for motor imagery)
+    csp_feats = extract_csp_features(raw_data)
+    # Concatenate all features
+    all_features = np.concatenate((base_features, mental_features, csp_feats))
+    return all_features
+
 
 # ----------------------------
 # Model Saving and Loading Utility
@@ -230,7 +295,8 @@ def perform_action(action):
 # ----------------------------
 def train_model():
     """
-    Trains a classifier (SVM or deep learning) using collected data.
+    Trains a classifier (SVM or deep learning) using the collected raw data.
+    Each raw sample is processed with extract_all_features() before training.
     Computes performance metrics, saves the model, and prints statistics.
     """
     global classifier, model_stats
@@ -238,26 +304,39 @@ def train_model():
     if os.path.exists(data_file):
         with open(data_file, "rb") as f:
             data = pickle.load(f)
-        X = np.array(data["features"])
+        # X_raw shape: (N_samples, 8, 125)
+        X_raw = np.array(data["features"])
         y = np.array(data["labels"])
+        X_features = []
+        for sample in X_raw:
+            feat = extract_all_features(sample)
+            X_features.append(feat)
+        X_features = np.array(X_features)
+        
         if USE_DEEP_LEARNING:
             num_classes = len(ACTIONS)
             model = Sequential([
-                Dense(64, activation='relu', input_shape=(X.shape[1],)),
+                Dense(256, activation='gelu', input_shape=(X_features.shape[1],)),
+                Dense(64, activation='elu'),
+                Dense(128, activation = 'gelu'),
+                Dense(64, activation='leaky_relu'),
                 Dense(32, activation='relu'),
+                Dense(64, activation='elu'),
+                Dropout(0.1),
+                Dense(64, activation='elu'),
                 Dense(num_classes, activation='softmax')
             ])
             model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-            model.fit(X, y, epochs=20, verbose=0)
+            model.fit(X_features, y, epochs=20, verbose=0)
         else:
             model = SVC(probability=True, decision_function_shape='ovr')
-            model.fit(X, y)
+            model.fit(X_features, y)
         classifier = model
         save_model(model)
         if USE_DEEP_LEARNING:
-            y_pred = np.argmax(model.predict(X), axis=1)
+            y_pred = np.argmax(model.predict(X_features), axis=1)
         else:
-            y_pred = model.predict(X)
+            y_pred = model.predict(X_features)
         acc = accuracy_score(y, y_pred)
         prec = precision_score(y, y_pred, average='macro', zero_division=0)
         rec = recall_score(y, y_pred, average='macro', zero_division=0)
@@ -283,13 +362,13 @@ def show_model_stats():
 # ----------------------------
 def process_eeg_commands():
     """
-    Continuously collects EEG data every 0.5 seconds, extracts features,
+    Continuously collects raw EEG data every 0.5 seconds, extracts features using extract_all_features(),
     uses the classifier to predict the action, and performs the corresponding keyboard action.
     """
     global running, classifier
     while running:
-        eeg_data = get_filtered_eeg()
-        features = extract_features(eeg_data)
+        raw_data = get_raw_eeg()  # Get raw 0.5 sec data (shape: (8, 125))
+        features = extract_all_features(raw_data)
         if classifier is not None:
             predicted_action = classify_action(classifier, features)
             if predicted_action:
@@ -298,16 +377,13 @@ def process_eeg_commands():
 
 def visualize_eeg():
     """
-    Displays a real-time plot of the last 10 seconds of EEG data for all 8 channels.
-    A rolling buffer of 10 seconds (2,500 samples at 250 Hz) is maintained for each channel.
-    Each channel is plotted in its own subplot.
-    The x-axis shows time from -10 to 0 seconds (with 0 being the current time),
-    and the y-axis is set to [-20, 20].
+    Displays a real-time plot of the last 10 seconds of raw EEG data for all 8 channels.
+    Maintains a rolling buffer (2,500 samples at 250 Hz) for each channel.
+    The x-axis shows time from -10 to 0 seconds and each subplot is labeled with the corresponding electrode name.
     """
     fs = 250
     window_duration = 10  # seconds
-    n_total = int(fs * window_duration)  # total samples for 10 seconds (2500 samples)
-    # Initialize a buffer for each of the 8 channels
+    n_total = int(fs * window_duration)  # 2500 samples
     buffer = np.zeros((8, n_total))
     time_axis = np.linspace(-window_duration, 0, n_total)
     
@@ -316,14 +392,14 @@ def visualize_eeg():
     lines = []
     for i in range(8):
         line, = axs[i].plot(time_axis, buffer[i])
-        axs[i].set_ylim(-40, 40)
-        axs[i].set_ylabel(f"Ch {i+1}")
+        axs[i].set_ylim(-100, 100)
+        axs[i].set_ylabel(electrode_names[i])
         lines.append(line)
     axs[-1].set_xlabel("Time (sec)")
     
     while running:
-        new_data = get_filtered_eeg()  # new_data shape: (8, 125)
-        # Update the buffer for each channel
+        raw_data = get_raw_eeg()  # raw_data shape: (8, 125)
+        new_data = filter_eeg(raw_data)
         for i in range(8):
             buffer[i] = np.roll(buffer[i], -new_data.shape[1])
             buffer[i, -new_data.shape[1]:] = new_data[i]
@@ -338,8 +414,8 @@ def visualize_eeg():
 # ----------------------------
 def start_collection():
     """
-    Collects EEG data for each defined action (including "none").
-    For each action, the user is prompted to get ready, then 10 samples are collected
+    Collects raw EEG data for each defined action (including "none").
+    For each action, the user is prompted to get ready, then 10 raw samples are collected
     (with a 1-second interval between samples). After collection, the user chooses whether
     to include the collected data in the dataset.
     """
@@ -351,21 +427,18 @@ def start_collection():
         data = {"features": [], "labels": []}
     
     for action in ACTIONS.keys():
-        tk.messagebox.showinfo("Data Collection", f"Get ready to perform '{action}'. Click OK when ready.")
+        messagebox.showinfo("Data Collection", f"Get ready to perform '{action}'. Click OK when ready.")
         print(f"Collecting data for {action}...")
-        temp_features = []
-        temp_labels = []
+        temp_data = []  # raw data samples
         for i in range(10):
             print(f"Collecting sample {i+1} of 10 for {action}...")
-            eeg_data = get_filtered_eeg()
-            features = extract_features(eeg_data)
-            temp_features.append(features)
-            temp_labels.append(ACTION_TO_INDEX[action])
+            raw_data = get_raw_eeg()  # raw sample of shape (8, 125)
+            temp_data.append(raw_data)
             time.sleep(1.0)
-        include = tk.messagebox.askyesno("Include Data", f"Include data for '{action}' in dataset?")
+        include = messagebox.askyesno("Include Data", f"Include data for '{action}' in dataset?")
         if include:
-            data["features"].extend(temp_features)
-            data["labels"].extend(temp_labels)
+            data["features"].extend(temp_data)
+            data["labels"].extend([ACTION_TO_INDEX[action]] * len(temp_data))
             print(f"Data for {action} included.")
         else:
             print(f"Data for {action} discarded.")
@@ -388,7 +461,7 @@ def start_gui():
     root = tk.Tk()
     root.title("EEG Keyboard Control System")
 
-    # StringVars for dynamic status display
+    # StringVars for dynamic display of current status
     simulated_mode_var = tk.StringVar(root)
     simulated_mode_var.set("Simulated EEG Mode" if SIMULATED else "Real EEG Mode")
     classifier_mode_var = tk.StringVar(root)
